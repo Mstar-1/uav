@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import ExponentialLR
 import random
 from collections import deque
 import matplotlib.pyplot as plt
@@ -18,7 +19,7 @@ import time   # 用于计算剩余时间
 
 # ============================ 环境 ============================
 class Drone2DEnv(gym.Env):
-    def __init__(self, grid_size=15, num_obstacles=8, render_mode=None):
+    def __init__(self, grid_size=15, num_obstacles=6, render_mode=None):
         super().__init__()
         self.grid_size = grid_size
         self.num_obstacles = num_obstacles
@@ -43,7 +44,11 @@ class Drone2DEnv(gym.Env):
         self.target = np.array([self.grid_size - 2.0, self.grid_size - 2.0], dtype=np.float32)
 
         self.steps = 0
-        self.max_steps = 300
+        self.max_steps = 400
+        # 添加位置历史记录用于检测停滞
+        self.pos_history = [self.pos.copy()]
+        # 重置上一轮距离
+        self.prev_dist = None
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -61,61 +66,36 @@ class Drone2DEnv(gym.Env):
 
         reward = 0.0
         
-        # 1. 距离奖励：靠近目标获得正奖励，远离获得负奖励
-        prev_dist = getattr(self, 'prev_dist', dist)
-        dist_change = prev_dist - dist  # 距离减少为正
-        reward += dist_change * 1.5
-        self.prev_dist = dist
+        # 1. 距离奖励：距离越近奖励越高，增加权重以增强优化动力
+        max_dist = np.linalg.norm([self.grid_size, self.grid_size])
+        distance_reward = (max_dist - dist) / max_dist * 2.0  # 增加权重到2.0
+        reward += distance_reward
         
-        # 2. 添加目标方向向量奖励：鼓励朝目标中心飞行，而不是在目标附近徘徊
-        target_direction = self.target - self.pos
-        dist_to_target = np.linalg.norm(target_direction)
-        if dist_to_target > 0.01:
-            target_direction_normalized = target_direction / dist_to_target
-            # 速度在目标方向上的分量
-            direction_alignment = np.dot(self.vel, target_direction_normalized)
-            reward += direction_alignment * 2.0  # 朝目标飞获得正奖励
-        
-        # 3. 目标中心接近奖励：距离目标越近，奖励越高（仅在距离<3.0时）
-        if dist < 3.0:
-            center_bonus = (3.0 - dist) * 2.0
-            reward += center_bonus
-        
-        # 4. 避障奖励系统
-        min_obstacle_dist = float('inf')
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                if self.grid[i, j] == 1:
-                    obstacle_pos = np.array([float(i), float(j)])
-                    d = np.linalg.norm(self.pos - obstacle_pos)
-                    if d < min_obstacle_dist:
-                        min_obstacle_dist = d
-        
-        if collided:
-            reward -= 50.0  # 碰撞惩罚
-        else:
-            if min_obstacle_dist < 1.5:
-                obstacle_penalty = (1.5 - min_obstacle_dist) * 8.0
-                reward -= obstacle_penalty
-                reward -= 0.05
-            else:
-                safety_bonus = min(0.5, (min_obstacle_dist - 1.5) * 0.3)
-                reward += safety_bonus
-
-        # 5. 目标到达奖励（必须真正到达）
+        # 2. 目标到达奖励：到达目标给予高额奖励
         if dist < 1.0:
-            reward += 80.0
-            terminated = True
-        elif dist < 2.0:
-            reward += 5.0
-
-        # 6. 增大步骤惩罚：强烈鼓励快速完成任务
-        reward -= 0.1  # 从-0.03增大到-0.1
-
-        # 7. 边界惩罚（增强）
-        if self.pos[0] < 0.5 or self.pos[0] > self.grid_size - 1.5 or \
-           self.pos[1] < 0.5 or self.pos[1] > self.grid_size - 1.5:
-            reward -= 0.5  # 增强边界惩罚
+            reward += 200.0  # 增加到达奖励到200.0
+        
+        # 3. 碰撞惩罚
+        if collided:
+            reward -= 150.0  # 增加碰撞惩罚到150.0
+        
+        # 4. 时间惩罚：鼓励尽快到达目标，降低惩罚以避免过早放弃
+        reward -= 0.05  # 降低时间惩罚到0.05
+        
+        # 5. 边界惩罚：避免靠近边界，保持适度
+        if self.pos[0] < 1.0 or self.pos[0] > self.grid_size - 2.0 or \
+           self.pos[1] < 1.0 or self.pos[1] > self.grid_size - 2.0:
+            reward -= 0.3  # 降低边界惩罚到0.3
+        
+        # 6. 停滞惩罚：防止原地不动，保持适度
+        self.pos_history.append(self.pos.copy())
+        if len(self.pos_history) > 10:
+            recent_positions = np.array(self.pos_history[-10:])
+            avg_movement = np.mean(np.linalg.norm(np.diff(recent_positions, axis=0), axis=1))
+            if avg_movement < 0.1:
+                reward -= 3.0  # 降低停滞惩罚到3.0
+        if len(self.pos_history) > 20:
+            self.pos_history.pop(0)
 
         terminated = collided or (dist < 1.0)
         truncated = self.steps >= self.max_steps
@@ -154,10 +134,14 @@ class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU(),
-            nn.Linear(512, action_dim), nn.Tanh()
+            nn.Linear(state_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),  # 添加dropout正则化
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),  # 添加dropout正则化
+            nn.Linear(512, action_dim),
+            nn.Tanh()
         )
     def forward(self, x):
         return self.net(x)
@@ -165,14 +149,30 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.q1 = nn.Sequential(nn.Linear(state_dim + action_dim, 512), nn.ReLU(),
-                                nn.Linear(512, 512), nn.ReLU(),
-                                nn.Linear(512, 512), nn.ReLU(),
-                                nn.Linear(512, 1))
-        self.q2 = nn.Sequential(nn.Linear(state_dim + action_dim, 512), nn.ReLU(),
-                                nn.Linear(512, 512), nn.ReLU(),
-                                nn.Linear(512, 512), nn.ReLU(),
-                                nn.Linear(512, 1))
+        self.q1 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),  # 添加dropout正则化
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),  # 添加dropout正则化
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),  # 添加dropout正则化
+            nn.Linear(512, 1)
+        )
+        self.q2 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),  # 添加dropout正则化
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),  # 添加dropout正则化
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),  # 添加dropout正则化
+            nn.Linear(512, 1)
+        )
     def forward(self, s, a):
         x = torch.cat([s, a], dim=1)
         return self.q1(x), self.q2(x)
@@ -188,26 +188,33 @@ class TD3Agent:
         self.actor = Actor(state_dim, action_dim).to(device)
         self.actor_target = Actor(state_dim, action_dim).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=1e-4)  # 降低学习率
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=1e-4)  # 保持Actor学习率
+        self.actor_scheduler = ExponentialLR(self.actor_opt, gamma=0.9995)  # 更慢的衰减率，让学习率保持更长时间
 
         self.critic = Critic(state_dim, action_dim).to(device)
         self.critic_target = Critic(state_dim, action_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=1e-3)  # Critic学习率可以稍高
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=3e-4)  # 保持Critic学习率
+        self.critic_scheduler = ExponentialLR(self.critic_opt, gamma=0.9990)  # 更慢的衰减率，让学习率保持更长时间
 
-        self.buffer = deque(maxlen=500000)  # 增大经验回放池
+        self.buffer = deque(maxlen=300000)  # 适当增大经验回放池
         self.batch_size = 256  # 增大批次大小
         self.gamma = 0.99
-        self.tau = 0.005
-        self.policy_noise = 0.2
-        self.noise_clip = 0.5
-        self.policy_delay = 2
+        self.tau = 0.001  # 保持软更新率
+        self.policy_noise = 0.2  # 适当增加策略噪声
+        self.noise_clip = 0.5  # 适当增加噪声裁剪
+        self.policy_delay = 2  # 调整策略延迟为2步
         self.updates_per_step = 2  # 每步环境交互训练2次
         self.total_steps = 0
 
     def select_action(self, state, noise_scale=0.1):
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        action = self.actor(state).cpu().detach().numpy()[0]
+        # 设置为评估模式，确保BatchNorm使用训练时的统计信息
+        self.actor.eval()
+        with torch.no_grad():
+            action = self.actor(state).cpu().detach().numpy()[0]
+        # 恢复训练模式
+        self.actor.train()
         if noise_scale > 0:
             noise = np.random.normal(0, noise_scale, size=2)
             action = np.clip(action + noise, -1.0, 1.0)
@@ -246,11 +253,15 @@ class TD3Agent:
             self.actor_opt.zero_grad()
             actor_loss.backward()
             self.actor_opt.step()
+            self.actor_scheduler.step()  # 学习率衰减
 
             for p, pt in zip(self.actor.parameters(), self.actor_target.parameters()):
                 pt.data.copy_(self.tau * p.data + (1 - self.tau) * pt.data)
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
                 pt.data.copy_(self.tau * p.data + (1 - self.tau) * pt.data)
+            
+            # Critic也进行学习率衰减
+            self.critic_scheduler.step()
 
     def save(self, path):
         torch.save({'actor': self.actor.state_dict(), 'critic': self.critic.state_dict()}, path)
@@ -273,11 +284,15 @@ def train():
     env = Drone2DEnv(grid_size=15, num_obstacles=8)
     agent = TD3Agent(state_dim=env.observation_space.shape[0], action_dim=2, device=device)
 
-    episodes = 1000
+    episodes = 2000
     rewards_history = []
     best_reward = -np.inf
     start_time = time.time()
     episode_times = []
+    
+    # 初始化成功率统计变量
+    total_episodes_reached_target = 0
+    episodes_reached_target_50 = 0
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"td3_drone_gpu_{timestamp}"
@@ -291,8 +306,16 @@ def train():
         ep_reward = 0
         done = False
 
-        # 噪声随训练逐渐衰减
-        noise_scale = max(0.05, 0.3 * (0.99 ** ep))
+        # 改进探索策略：使用简单而有效的高斯噪声，缓慢衰减
+        # 基础噪声：初始值1.0，缓慢衰减到0.1，降低衰减率以保持更长时间的探索
+        base_noise = max(0.1, 1.0 * (0.995 ** ep))
+        # 每10个回合增加一次探索强度，提高探索频率和强度
+        if ep % 10 == 0:
+            periodic_exploration = 0.5
+        else:
+            periodic_exploration = 0.0
+        # 综合噪声
+        noise_scale = base_noise + periodic_exploration
 
         while not done:
             action = agent.select_action(state, noise_scale)
@@ -306,6 +329,12 @@ def train():
             
             state = next_state
             ep_reward += reward
+
+        # 检查是否成功到达终点
+        final_dist = np.linalg.norm(env.pos - env.target)
+        if final_dist < 1.0:
+            total_episodes_reached_target += 1
+            episodes_reached_target_50 += 1
 
         rewards_history.append(ep_reward)
         episode_times.append(time.time() - ep_start)
@@ -323,6 +352,19 @@ def train():
             avg_reward = np.mean(rewards_history[-50:]) if len(rewards_history) >= 50 else np.mean(rewards_history)
             print(f"Episode {ep}/{episodes} | 近50轮平均奖励: {avg_reward:+.2f} | "
                   f"预计剩余时间: {eta_str} | 本轮用时: {episode_times[-1]:.1f}s")
+        
+        # === 每50个episode计算并打印成功率 ===
+        if ep % 50 == 0:
+            success_rate_50 = episodes_reached_target_50 / 50 * 100
+            total_success_rate = total_episodes_reached_target / ep * 100
+            print(f"\n=== 第 {ep-49} 到 {ep} 轮统计 ===")
+            print(f"到达终点次数: {episodes_reached_target_50} / 50")
+            print(f"成功率: {success_rate_50:.1f}%")
+            print(f"累计总成功率: {total_success_rate:.1f}%")
+            print(f"总到达次数: {total_episodes_reached_target} / {ep}")
+            print("="*35)
+            # 重置50轮统计
+            episodes_reached_target_50 = 0
 
     # 保存最终结果
     agent.save(os.path.join(save_dir, "final_model.pth"))
